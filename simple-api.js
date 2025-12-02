@@ -10,6 +10,76 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const axios = require('axios');
 
+// Prometheus metrics
+const promClient = require('prom-client');
+
+// Create a Registry to register the metrics
+const register = new promClient.Registry();
+
+// Add default metrics (CPU, memory, event loop, etc.)
+promClient.collectDefaultMetrics({
+  register,
+  prefix: 'spider_api_'
+});
+
+// Custom HTTP metrics
+const httpRequestsTotal = new promClient.Counter({
+  name: 'spider_api_http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status_code'],
+  registers: [register]
+});
+
+const httpRequestDuration = new promClient.Histogram({
+  name: 'spider_api_http_request_duration_seconds',
+  help: 'Duration of HTTP requests in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300],
+  registers: [register]
+});
+
+const httpRequestsInFlight = new promClient.Gauge({
+  name: 'spider_api_http_requests_in_flight',
+  help: 'Number of HTTP requests currently being processed',
+  registers: [register]
+});
+
+// Custom scraping metrics
+const scrapingRequestsTotal = new promClient.Counter({
+  name: 'spider_api_scraping_requests_total',
+  help: 'Total number of scraping requests',
+  labelNames: ['mode', 'status'],
+  registers: [register]
+});
+
+const scrapingDuration = new promClient.Histogram({
+  name: 'spider_api_scraping_duration_seconds',
+  help: 'Duration of scraping operations in seconds',
+  labelNames: ['mode', 'status'],
+  buckets: [1, 5, 10, 30, 60, 120, 300, 600],
+  registers: [register]
+});
+
+const scrapingPagesTotal = new promClient.Counter({
+  name: 'spider_api_scraping_pages_total',
+  help: 'Total number of pages scraped',
+  labelNames: ['mode'],
+  registers: [register]
+});
+
+const scrapingErrorsTotal = new promClient.Counter({
+  name: 'spider_api_scraping_errors_total',
+  help: 'Total number of scraping errors',
+  labelNames: ['error_type'],
+  registers: [register]
+});
+
+const scrapingActiveRequests = new promClient.Gauge({
+  name: 'spider_api_scraping_active_requests',
+  help: 'Number of active scraping requests',
+  registers: [register]
+});
+
 // Try to load native module, fallback to HTTP if it fails
 let Website = null;
 let useNativeModule = false;
@@ -66,6 +136,7 @@ app.use(helmet());
 app.use(cors());
 app.use(morgan('combined'));
 app.use(express.json({ limit: '100mb' }));
+app.use(metricsMiddleware); // Add Prometheus metrics tracking
 
 // Rate limiting - Updated for high concurrency
 const limiter = rateLimit({
@@ -121,6 +192,41 @@ function apiKeyAuth(req, res, next) {
 
   // API key is valid, proceed to next middleware
   console.log('✅ API key validated successfully');
+  next();
+}
+
+// Prometheus metrics middleware
+function metricsMiddleware(req, res, next) {
+  const start = Date.now();
+  httpRequestsInFlight.inc();
+
+  // Capture the original end function
+  const originalEnd = res.end;
+
+  // Override the end function to record metrics
+  res.end = function (...args) {
+    const duration = (Date.now() - start) / 1000; // Convert to seconds
+    const route = req.route ? req.route.path : req.path;
+    const statusCode = res.statusCode.toString();
+
+    // Record metrics
+    httpRequestsTotal.inc({
+      method: req.method,
+      route: route,
+      status_code: statusCode
+    });
+
+    httpRequestDuration.observe(
+      { method: req.method, route: route, status_code: statusCode },
+      duration
+    );
+
+    httpRequestsInFlight.dec();
+
+    // Call the original end function
+    originalEnd.apply(res, args);
+  };
+
   next();
 }
 
@@ -365,6 +471,7 @@ function extractTextContent(html) {
 // Single comprehensive route - Protected with API key authentication
 app.post('/scrap', apiKeyAuth, handleConcurrentRequests, async (req, res) => {
   const startTime = Date.now();
+  scrapingActiveRequests.inc(); // Track active scraping requests
 
   try {
     const {
@@ -838,10 +945,25 @@ app.post('/scrap', apiKeyAuth, handleConcurrentRequests, async (req, res) => {
       console.log(`🏗️  CMS: None detected`);
     }
 
+    // Record Prometheus metrics for successful scraping
+    const scrapingDurationSeconds = (Date.now() - startTime) / 1000;
+    scrapingRequestsTotal.inc({ mode: mode, status: 'success' });
+    scrapingDuration.observe({ mode: mode, status: 'success' }, scrapingDurationSeconds);
+    scrapingPagesTotal.inc({ mode: mode }, result.summary.totalPages);
+    scrapingActiveRequests.dec();
+
     res.json(result);
 
   } catch (error) {
     console.error('Scraping error:', error);
+
+    // Record Prometheus metrics for failed scraping
+    const scrapingDurationSeconds = (Date.now() - startTime) / 1000;
+    scrapingRequestsTotal.inc({ mode: req.body.mode || 'single', status: 'error' });
+    scrapingDuration.observe({ mode: req.body.mode || 'single', status: 'error' }, scrapingDurationSeconds);
+    scrapingErrorsTotal.inc({ error_type: error.code || 'UNKNOWN' });
+    scrapingActiveRequests.dec();
+
     res.status(500).json({
       error: 'Scraping failed',
       message: error.message,
@@ -875,6 +997,16 @@ app.get('/status', (req, res) => {
     uptime: process.uptime(),
     timestamp: new Date().toISOString()
   });
+});
+
+// Prometheus metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  } catch (error) {
+    res.status(500).end(error);
+  }
 });
 
 // Error handling

@@ -104,6 +104,29 @@ Get server status and metrics.
 }
 ```
 
+### GET /metrics
+Get Prometheus metrics for monitoring.
+
+**Authentication:** Not required
+
+**Response:** Prometheus text format with all collected metrics
+
+**Metrics Available:**
+- `spider_api_http_requests_total` - Total HTTP requests by method, route, and status
+- `spider_api_http_request_duration_seconds` - HTTP request duration histogram
+- `spider_api_http_requests_in_flight` - Current number of requests being processed
+- `spider_api_scraping_requests_total` - Total scraping requests by mode and status
+- `spider_api_scraping_duration_seconds` - Scraping operation duration histogram
+- `spider_api_scraping_pages_total` - Total pages scraped by mode
+- `spider_api_scraping_errors_total` - Total scraping errors by type
+- `spider_api_scraping_active_requests` - Current active scraping operations
+- Default Node.js metrics (CPU, memory, event loop, etc.)
+
+**Example:**
+```bash
+curl http://localhost:3001/metrics
+```
+
 ## Request Format
 
 ### Single Page Scraping
